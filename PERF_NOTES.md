@@ -306,3 +306,93 @@ Low.
   insert into a sorted slice mid-walk; correctness is verified by the
   random-sequence equivalence test, which exercises this path heavily
   in the `warm_5K_2K_collision` and `warm_10K_2K_collision` shapes.
+
+## Milestone 4 — `ShardedSMT` parallel sub-tree wrapper
+
+Branch: `perf/m4-sharded`. Implementation: `sharded.go`.
+
+### What changed
+
+A new public type that fans BulkUpdate out to N independent
+`SparseMerkleTree` shards, parallelizing per-shard work:
+
+```go
+func NewShardedSMT(
+    shardCount int,                                   // power of two, 1..64
+    mapstoreFactory func(idx int) (nodes, values MapStore),
+    hasherFactory func() hash.Hash,
+) (*ShardedSMT, error)
+
+func (s *ShardedSMT) Update(key, value []byte) ([]byte, error)
+func (s *ShardedSMT) BulkUpdate(keys, values [][]byte) ([]byte, error)
+func (s *ShardedSMT) Get(key []byte) ([]byte, error)
+func (s *ShardedSMT) Root() []byte
+func (s *ShardedSMT) ShardRoot(idx int) []byte
+```
+
+### Routing
+
+Each key's shard is decided by the **first 6 bits of `sha256(key)`**
+(or top `log2(N)` bits for non-64 shard counts). Using a fixed routing
+hash decouples shard load from the per-shard tree's hasher and gives
+uniform distribution regardless of input distribution. Mission spec
+suggested "first byte of key hash"; we deliberately use sha256(key)
+rather than the user-supplied path digest so that the routing is
+hasher-agnostic.
+
+### Combined-root construction
+
+The N shard sub-roots are folded into a balanced Merkle tree using the
+existing SMT internal-node format (`digest(nodePrefix || left ||
+right)`). With 64 shards × 32-byte hashes, the fold runs **63 hashes
+total** — negligible against the ~100K-1M hashes inside the shards.
+
+### Property tests
+
+`sharded_test.go`:
+
+- **`TestShardedSMT_DeterministicRoot`** — same input sequence on two
+  independent ShardedSMTs produces the same combined root, across
+  shard counts 1, 2, 4, 8, 16, 32, 64.
+- **`TestShardedSMT_BulkEquivalentToSingleApply`** — applying a 1500-op
+  delta via BulkUpdate yields the same combined root as applying each
+  op via Update one at a time. The core safety property of the
+  parallel fan-out.
+- **`TestShardedSMT_GetAfterBulk`** — every (k,v) inserted via
+  BulkUpdate is retrievable via Get from the same ShardedSMT.
+- **`TestShardedSMT_ShardCountValidation`** — only powers of two
+  between 1 and 64 are accepted.
+
+### Concurrency model
+
+`BulkUpdate` buckets the input slice into per-shard sub-batches, then
+spawns one goroutine per non-empty shard, waits for all via
+`sync.WaitGroup`, computes the combined root, and returns. The
+underlying `SparseMerkleTree` is NOT concurrent-safe per shard; that's
+fine because each shard's work runs on a single dedicated goroutine.
+
+### EC2 results (pending — bench in progress)
+
+Will populate this section when the EC2 sweep completes.
+
+### Proof API
+
+NOT IMPLEMENTED on the wrapper. Per-shard proofs are still available
+via `s.shards[i].Prove(key)`, and verifiers can replay the sequenced
+tx stream into a fresh ShardedSMT to re-derive the root. A combined
+"sharded proof" (per-shard SMT proof + Merkle inclusion of the shard
+root in the final root) is straightforward to add (~30 lines) but
+sits outside the perf path and is left as a follow-up.
+
+### Regression risk
+
+Low for the perf-only deliverable. The wrapper is purely additive —
+constructing a `SparseMerkleTree` directly behaves identically to
+before this branch.
+
+The proof-API gap means the final root produced by ShardedSMT is
+**reproducible by any verifier running ShardedSMT with the same shard
+count and hasher**, but not directly verifiable via the existing
+`VerifyProof`. Document this clearly to consumers; if they need
+on-the-wire single-key proofs against the sharded root, the sharded
+proof shape needs to be added before deployment.
