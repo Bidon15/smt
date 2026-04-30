@@ -10,18 +10,12 @@ jobs:
   build_fuzz:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/setup-go@v2
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
-          go-version: "1.15"
-      - uses: actions/checkout@v2
-      - uses: technote-space/get-diff-action@v4
-        with:
-          PATTERNS: |
-            **/**.go
-            go.mod
-            go.sum
+          go-version: "1.25"
       - name: install deps
-        run: go get -u github.com/dvyukov/go-fuzz/go-fuzz github.com/dvyukov/go-fuzz/go-fuzz-build
+        run: go install github.com/dvyukov/go-fuzz/go-fuzz@latest && go install github.com/dvyukov/go-fuzz/go-fuzz-build@latest
       - name: build fuzz
         run: go-fuzz-build
         working-directory: fuzz
