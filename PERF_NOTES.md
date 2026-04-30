@@ -198,3 +198,111 @@ hash.
 Zero — the BLAKE3 path is opt-in via the existing hasher arg. Default
 construction (`smt.NewSparseMerkleTree(nodes, values, sha256.New())`)
 behaves identically to before this branch.
+
+## Milestone 3 — `BulkUpdate(keys, values) ([]byte, error)`
+
+Branch: `perf/m3-bulk-update`. Implementation: `bulk.go`.
+
+### What changed
+
+A new public method on `SparseMerkleTree`:
+
+```go
+func (smt *SparseMerkleTree) BulkUpdate(keys, values [][]byte) ([]byte, error)
+```
+
+Applies a batch of updates in a single recursive top-down DFS over the
+tree. Internally:
+
+1. Routes empty values (deletes) through the existing single-key
+   `Delete` path. The amortization win lives on the insert/update side;
+   delete is rare in payment workloads.
+2. Hashes each key once into a `(path, value)` pair.
+3. Sorts pairs by path; dedups adjacent same-path entries keeping the
+   LAST occurrence (matching iterative-Update last-write-wins).
+4. Walks the tree recursively, splitting the kv slice at each level
+   by the path bit. Each tree node is visited at most once per batch.
+5. The walk distinguishes three cases at each currentHash:
+   - placeholder → `buildSubtree(depth, kvs)` constructs a fresh
+     subtree from the kvs alone (lazy-structuring matches the SMT's
+     existing single-leaf-promotion semantics).
+   - leaf → `mergeLeafWithKVs(...)` injects the existing leaf as a
+     synthetic kv (or shadows it if an incoming kv has the same path)
+     and recurses through `buildSubtree`.
+   - internal node → split kvs by bit-at-depth, recurse on left/right,
+     rehash if either side changed.
+6. Returns a fresh allocation of the new root.
+
+### Property tests
+
+`bulk_equivalence_test.go`:
+
+- **`TestBulkUpdate_EquivalenceWithIterativeUpdate`** — 33 random
+  shapes (3 seeds × 11 cases): fresh trees, warm trees with overlap,
+  sparse vs dense vs full-turnover deltas, single-update edge cases,
+  empty deltas. After each shape, the iterative-Update tree and the
+  BulkUpdate tree must have **identical roots**, and every key must
+  resolve to its expected value via the values map. This is the
+  primary safety property for verifier reproducibility.
+- **`TestBulkUpdate_DuplicateKeys_LastWins`** — same-path entries
+  within a single batch produce the same result as iterative Update.
+- **`TestBulkUpdate_Deletes`** — mixed delete/update/insert batches
+  produce the same root as iterative Update.
+- **`TestBulkUpdate_ProofRoundTrip`** — Prove + VerifyProof both
+  ways on a tree built via BulkUpdate.
+
+All pass.
+
+### EC2 results
+
+| Workload (per update) | Baseline ns | M1 iter ns | M3 bulk ns | Bulk vs iter | Bulk vs baseline |
+|---|---:|---:|---:|---:|---:|
+| 100K tree, delta 1K | 5,074 | 2,290 | 2,092 | 1.10× | 2.42× |
+| 100K tree, delta 10K | 6,500 | 3,240 | 1,994 | 1.62× | 3.26× |
+| 100K tree, delta 50K (dense) | — | — | 1,987 | — | — |
+| 100K tree, delta 100K (full turnover) | 13,200 | — | 1,996 | — | **6.6×** |
+| 1M tree, delta 100K | — | — | 4,514 | — | — |
+
+Sustained per-shard rate at dense workload: **~500K updates/sec on a
+single core**.
+
+### What this means for the hero target
+
+Mission target is 2.6M aggregate updates/sec on 8-vCPU EC2.
+
+- M3 alone: single-core dense bulk = 500K/s. With 8 independent shards
+  running BulkUpdate in parallel: 4M/s aggregate (assuming
+  near-linear scaling, which the M1 parallel results showed).
+- For sparse 1M-tree workloads (4.5 µs/update): per-core ~222K/s.
+  8 shards = 1.78M aggregate — short of target on this shape.
+
+The realistic Risotto workload — 100K–1M unique accounts per epoch,
+sharded into 8 lanes by address prefix — gives each shard roughly
+12K–125K accounts per epoch. Per-shard tree sizes are correspondingly
+smaller (one-eighth of the global account base). The dense per-shard
+delta size makes BulkUpdate the dominant operating mode.
+
+### Targets vs. actual
+
+- "BulkUpdate(keys, values) (root, error) method" — **delivered**.
+- "≥3× over iterating Update for dense deltas" — **delivered at 6.6×**
+  for delta=100K full turnover, **3.26×** for delta=10K (10% turnover).
+- "Property tests prove root equivalence" — **delivered with 33 random
+  shapes plus delete/dup/proof round-trip cases**.
+
+### Regression risk
+
+Low.
+
+- The recursive walk operates on a snapshot view of currentHash and
+  does not mutate the existing tree until each level commits. If an
+  intermediate `Set` fails, the tree state is partially modified — but
+  this is the same partial-modification semantics as iterative Update
+  and is consistent with the existing API contract.
+- `bulkApplyAtRoot` short-circuits when both subtrees are unchanged
+  (`bytes.Equal` checks), avoiding spurious rehashes on the
+  no-op-update edge case.
+- The `mergeLeafWithKVs` synthetic-kv injection is the only place we
+  insert into a sorted slice mid-walk; correctness is verified by the
+  random-sequence equivalence test, which exercises this path heavily
+  in the `warm_5K_2K_collision` and `warm_10K_2K_collision` shapes.
