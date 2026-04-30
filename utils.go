@@ -43,9 +43,12 @@ func emptyBytes(length int) []byte {
 }
 
 func reverseByteSlices(slices [][]byte) [][]byte {
+	reverseByteSlicesInPlace(slices)
+	return slices
+}
+
+func reverseByteSlicesInPlace(slices [][]byte) {
 	for left, right := 0, len(slices)-1; left < right; left, right = left+1, right-1 {
 		slices[left], slices[right] = slices[right], slices[left]
 	}
-
-	return slices
 }

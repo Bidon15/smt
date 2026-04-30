@@ -115,8 +115,14 @@ func (smt *SparseMerkleTree) Delete(key []byte) ([]byte, error) {
 
 // UpdateForRoot sets a new value for a key in the tree at a specific root, and returns the new root.
 func (smt *SparseMerkleTree) UpdateForRoot(key []byte, value []byte, root []byte) ([]byte, error) {
-	path := smt.th.path(key)
-	sideNodes, pathNodes, oldLeafData, _, err := smt.sideNodesForRoot(path, root, false)
+	ps := getPathSlices()
+	defer putPathSlices(ps)
+	sc := getUpdateScratch()
+	defer putUpdateScratch(sc)
+
+	path := smt.th.pathInto(sc.pathBuf[:], key)
+
+	oldLeafData, _, err := smt.fillSideNodes(ps, path, root, false)
 	if err != nil {
 		return nil, err
 	}
@@ -124,7 +130,7 @@ func (smt *SparseMerkleTree) UpdateForRoot(key []byte, value []byte, root []byte
 	var newRoot []byte
 	if bytes.Equal(value, defaultValue) {
 		// Delete operation.
-		newRoot, err = smt.deleteWithSideNodes(path, sideNodes, pathNodes, oldLeafData)
+		newRoot, err = smt.deleteWithSideNodes(sc, path, ps.sideNodes, ps.pathNodes, oldLeafData)
 		if errors.Is(err, errKeyAlreadyEmpty) {
 			// This key is already empty; return the old root.
 			return root, nil
@@ -135,7 +141,15 @@ func (smt *SparseMerkleTree) UpdateForRoot(key []byte, value []byte, root []byte
 
 	} else {
 		// Insert or update operation.
-		newRoot, err = smt.updateWithSideNodes(path, value, sideNodes, pathNodes, oldLeafData)
+		newRoot, err = smt.updateWithSideNodes(sc, path, value, ps.sideNodes, ps.pathNodes, oldLeafData)
+	}
+	if newRoot != nil {
+		// Copy the root into a fresh allocation; the underlying scratch
+		// buffer goes back to the pool and will be overwritten by the
+		// next Update.
+		out := make([]byte, len(newRoot))
+		copy(out, newRoot)
+		newRoot = out
 	}
 	return newRoot, err
 }
@@ -145,7 +159,7 @@ func (smt *SparseMerkleTree) DeleteForRoot(key, root []byte) ([]byte, error) {
 	return smt.UpdateForRoot(key, defaultValue, root)
 }
 
-func (smt *SparseMerkleTree) deleteWithSideNodes(path []byte, sideNodes [][]byte, pathNodes [][]byte, oldLeafData []byte) ([]byte, error) {
+func (smt *SparseMerkleTree) deleteWithSideNodes(sc *updateScratch, path []byte, sideNodes [][]byte, pathNodes [][]byte, oldLeafData []byte) ([]byte, error) {
 	if bytes.Equal(pathNodes[0], smt.th.placeholder()) {
 		// This key is already empty as it is a placeholder; return an error.
 		return nil, errKeyAlreadyEmpty
@@ -155,12 +169,15 @@ func (smt *SparseMerkleTree) deleteWithSideNodes(path []byte, sideNodes [][]byte
 		// This key is already empty as a different key was found its place; return an error.
 		return nil, errKeyAlreadyEmpty
 	}
-	// All nodes above the deleted leaf are now orphaned
+	// All nodes above the deleted leaf are now orphaned.
 	for _, node := range pathNodes {
 		if err := smt.nodes.Delete(node); err != nil {
 			return nil, err
 		}
 	}
+
+	turn := 0
+	hashBufs := [2][]byte{sc.hashBufA[:], sc.hashBufB[:]}
 
 	var currentHash, currentData []byte
 	nonPlaceholderReached := false
@@ -173,6 +190,9 @@ func (smt *SparseMerkleTree) deleteWithSideNodes(path []byte, sideNodes [][]byte
 
 			if smt.th.isLeaf(sideNodeValue) {
 				// This is the leaf sibling that needs to be bubbled up the tree.
+				// currentHash and currentData both alias `sideNode` (a slice into
+				// a still-live MapStore value). They must NOT be written, so we
+				// don't burn a tick-tock buffer this iteration.
 				currentHash = sideNode
 				currentData = sideNode
 				continue
@@ -194,14 +214,15 @@ func (smt *SparseMerkleTree) deleteWithSideNodes(path []byte, sideNodes [][]byte
 		}
 
 		if getBitAtFromMSB(path, len(sideNodes)-1-i) == right {
-			currentHash, currentData = smt.th.digestNode(sideNode, currentData)
+			currentHash, currentData = smt.th.digestNodeInto(hashBufs[turn], sideNode, currentData)
 		} else {
-			currentHash, currentData = smt.th.digestNode(currentData, sideNode)
+			currentHash, currentData = smt.th.digestNodeInto(hashBufs[turn], currentData, sideNode)
 		}
 		if err := smt.nodes.Set(currentHash, currentData); err != nil {
 			return nil, err
 		}
 		currentData = currentHash
+		turn ^= 1
 	}
 
 	if currentHash == nil {
@@ -211,13 +232,27 @@ func (smt *SparseMerkleTree) deleteWithSideNodes(path []byte, sideNodes [][]byte
 	return currentHash, nil
 }
 
-func (smt *SparseMerkleTree) updateWithSideNodes(path []byte, value []byte, sideNodes [][]byte, pathNodes [][]byte, oldLeafData []byte) ([]byte, error) {
-	valueHash := smt.th.digest(value)
-	currentHash, currentData := smt.th.digestLeaf(path, valueHash)
+// updateWithSideNodes builds the new spine from the leaf upward. The hash
+// for each level is written into one of two pooled scratch buffers
+// (sc.hashBufA / sc.hashBufB) which alternate via the `turn` index. This
+// removes the per-level Sum(nil) allocation that h.Hash.Sum incurs.
+//
+// Tick-tock invariant: at the top of each iteration, currentHash points
+// into sc.hashBuf[1-turn] (the buffer last written), and we write the
+// new hash into sc.hashBuf[turn]. After the digestNode/Set/swap, the
+// previous-level buffer is no longer aliased by any reachable variable
+// — Set copies the key — so it's safe to overwrite on the next swap.
+func (smt *SparseMerkleTree) updateWithSideNodes(sc *updateScratch, path []byte, value []byte, sideNodes [][]byte, pathNodes [][]byte, oldLeafData []byte) ([]byte, error) {
+	turn := 0
+	hashBufs := [2][]byte{sc.hashBufA[:], sc.hashBufB[:]}
+
+	valueHash := smt.th.digestInto(sc.valueHashBuf[:], value)
+	currentHash, currentData := smt.th.digestLeafInto(hashBufs[turn], path, valueHash)
 	if err := smt.nodes.Set(currentHash, currentData); err != nil {
 		return nil, err
 	}
 	currentData = currentHash
+	turn ^= 1
 
 	// If the leaf node that sibling nodes lead to has a different actual path
 	// than the leaf node being updated, we need to create an intermediate node
@@ -236,23 +271,23 @@ func (smt *SparseMerkleTree) updateWithSideNodes(path []byte, value []byte, side
 	}
 	if commonPrefixCount != smt.depth() {
 		if getBitAtFromMSB(path, commonPrefixCount) == right {
-			currentHash, currentData = smt.th.digestNode(pathNodes[0], currentData)
+			currentHash, currentData = smt.th.digestNodeInto(hashBufs[turn], pathNodes[0], currentData)
 		} else {
-			currentHash, currentData = smt.th.digestNode(currentData, pathNodes[0])
+			currentHash, currentData = smt.th.digestNodeInto(hashBufs[turn], currentData, pathNodes[0])
 		}
 
-		err := smt.nodes.Set(currentHash, currentData)
-		if err != nil {
+		if err := smt.nodes.Set(currentHash, currentData); err != nil {
 			return nil, err
 		}
 
 		currentData = currentHash
+		turn ^= 1
 	} else if oldValueHash != nil {
-		// Short-circuit if the same value is being set
+		// Short-circuit if the same value is being set.
 		if bytes.Equal(oldValueHash, valueHash) {
 			return smt.root, nil
 		}
-		// If an old leaf exists, remove it
+		// If an old leaf exists, remove it.
 		if err := smt.nodes.Delete(pathNodes[0]); err != nil {
 			return nil, err
 		}
@@ -260,7 +295,7 @@ func (smt *SparseMerkleTree) updateWithSideNodes(path []byte, value []byte, side
 			return nil, err
 		}
 	}
-	// All remaining path nodes are orphaned
+	// All remaining path nodes are orphaned.
 	for i := 1; i < len(pathNodes); i++ {
 		if err := smt.nodes.Delete(pathNodes[i]); err != nil {
 			return nil, err
@@ -289,15 +324,15 @@ func (smt *SparseMerkleTree) updateWithSideNodes(path []byte, value []byte, side
 		}
 
 		if getBitAtFromMSB(path, smt.depth()-1-i) == right {
-			currentHash, currentData = smt.th.digestNode(sideNode, currentData)
+			currentHash, currentData = smt.th.digestNodeInto(hashBufs[turn], sideNode, currentData)
 		} else {
-			currentHash, currentData = smt.th.digestNode(currentData, sideNode)
+			currentHash, currentData = smt.th.digestNodeInto(hashBufs[turn], currentData, sideNode)
 		}
-		err := smt.nodes.Set(currentHash, currentData)
-		if err != nil {
+		if err := smt.nodes.Set(currentHash, currentData); err != nil {
 			return nil, err
 		}
 		currentData = currentHash
+		turn ^= 1
 	}
 	if err := smt.values.Set(path, value); err != nil {
 		return nil, err
@@ -306,39 +341,45 @@ func (smt *SparseMerkleTree) updateWithSideNodes(path []byte, value []byte, side
 	return currentHash, nil
 }
 
-// Get all the sibling nodes (sidenodes) for a given path from a given root.
-// Returns an array of sibling nodes, the leaf hash found at that path, the
-// leaf data, and the sibling data.
-//
-// If the leaf is a placeholder, the leaf data is nil.
+// sideNodesForRoot is a back-compat wrapper that allocates pathSlices
+// internally. New hot-path code should use fillSideNodes with a pooled
+// *pathSlices to avoid two slice allocations per call.
 func (smt *SparseMerkleTree) sideNodesForRoot(path []byte, root []byte, getSiblingData bool) ([][]byte, [][]byte, []byte, []byte, error) {
-	// Side nodes for the path. Nodes are inserted in reverse order, then the
-	// slice is reversed at the end.
-	sideNodes := make([][]byte, 0, smt.depth())
-	pathNodes := make([][]byte, 0, smt.depth()+1)
-	pathNodes = append(pathNodes, root)
+	ps := &pathSlices{
+		sideNodes: make([][]byte, 0, smt.depth()),
+		pathNodes: make([][]byte, 0, smt.depth()+1),
+	}
+	leafData, siblingData, err := smt.fillSideNodes(ps, path, root, getSiblingData)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	return ps.sideNodes, ps.pathNodes, leafData, siblingData, nil
+}
+
+// fillSideNodes walks the tree from root toward the leaf at path, populating
+// ps.sideNodes and ps.pathNodes. The slices are returned in root-to-leaf
+// order (already reversed). Returns the leaf data found at path (nil if a
+// placeholder) and, when getSiblingData is true, the data of the final
+// sibling.
+func (smt *SparseMerkleTree) fillSideNodes(ps *pathSlices, path []byte, root []byte, getSiblingData bool) (leafData, siblingData []byte, err error) {
+	ps.pathNodes = append(ps.pathNodes, root)
 
 	if bytes.Equal(root, smt.th.placeholder()) {
-		// If the root is a placeholder, there are no sidenodes to return.
-		// Let the "actual path" be the input path.
-		return sideNodes, pathNodes, nil, nil, nil
+		return nil, nil, nil
 	}
 
 	currentData, err := smt.nodes.Get(root)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, err
 	} else if smt.th.isLeaf(currentData) {
-		// If the root is a leaf, there are also no sidenodes to return.
-		return sideNodes, pathNodes, currentData, nil, nil
+		return currentData, nil, nil
 	}
 
 	var nodeHash []byte
 	var sideNode []byte
-	var siblingData []byte
 	for i := 0; i < smt.depth(); i++ {
 		leftNode, rightNode := smt.th.parseNode(currentData)
 
-		// Get sidenode depending on whether the path bit is on or off.
 		if getBitAtFromMSB(path, i) == right {
 			sideNode = leftNode
 			nodeHash = rightNode
@@ -346,20 +387,18 @@ func (smt *SparseMerkleTree) sideNodesForRoot(path []byte, root []byte, getSibli
 			sideNode = rightNode
 			nodeHash = leftNode
 		}
-		sideNodes = append(sideNodes, sideNode)
-		pathNodes = append(pathNodes, nodeHash)
+		ps.sideNodes = append(ps.sideNodes, sideNode)
+		ps.pathNodes = append(ps.pathNodes, nodeHash)
 
 		if bytes.Equal(nodeHash, smt.th.placeholder()) {
-			// If the node is a placeholder, we've reached the end.
 			currentData = nil
 			break
 		}
 
 		currentData, err = smt.nodes.Get(nodeHash)
 		if err != nil {
-			return nil, nil, nil, nil, err
+			return nil, nil, err
 		} else if smt.th.isLeaf(currentData) {
-			// If the node is a leaf, we've reached the end.
 			break
 		}
 	}
@@ -367,10 +406,12 @@ func (smt *SparseMerkleTree) sideNodesForRoot(path []byte, root []byte, getSibli
 	if getSiblingData {
 		siblingData, err = smt.nodes.Get(sideNode)
 		if err != nil {
-			return nil, nil, nil, nil, err
+			return nil, nil, err
 		}
 	}
-	return reverseByteSlices(sideNodes), reverseByteSlices(pathNodes), currentData, siblingData, nil
+	reverseByteSlicesInPlace(ps.sideNodes)
+	reverseByteSlicesInPlace(ps.pathNodes)
+	return currentData, siblingData, nil
 }
 
 // Prove generates a Merkle proof for a key against the current root.
@@ -407,13 +448,16 @@ func (smt *SparseMerkleTree) ProveUpdatableForRoot(key []byte, root []byte) (Spa
 
 func (smt *SparseMerkleTree) doProveForRoot(key []byte, root []byte, isUpdatable bool) (SparseMerkleProof, error) {
 	path := smt.th.path(key)
-	sideNodes, pathNodes, leafData, siblingData, err := smt.sideNodesForRoot(path, root, isUpdatable)
+	ps := getPathSlices()
+	defer putPathSlices(ps)
+
+	leafData, siblingData, err := smt.fillSideNodes(ps, path, root, isUpdatable)
 	if err != nil {
 		return SparseMerkleProof{}, err
 	}
 
 	var nonEmptySideNodes [][]byte
-	for _, v := range sideNodes {
+	for _, v := range ps.sideNodes {
 		if v != nil {
 			nonEmptySideNodes = append(nonEmptySideNodes, v)
 		}
@@ -422,7 +466,7 @@ func (smt *SparseMerkleTree) doProveForRoot(key []byte, root []byte, isUpdatable
 	// Deal with non-membership proofs. If the leaf hash is the placeholder
 	// value, we do not need to add anything else to the proof.
 	var nonMembershipLeafData []byte
-	if !bytes.Equal(pathNodes[0], smt.th.placeholder()) {
+	if !bytes.Equal(ps.pathNodes[0], smt.th.placeholder()) {
 		actualPath, _ := smt.th.parseLeaf(leafData)
 		if !bytes.Equal(actualPath, path) {
 			// This is a non-membership proof that involves showing a different leaf.

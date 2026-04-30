@@ -27,8 +27,24 @@ func (th *treeHasher) digest(data []byte) []byte {
 	return sum
 }
 
+// digestInto writes the digest of data into dst[:0] and returns the resulting
+// slice. The caller is responsible for ensuring dst has at least Size bytes
+// of capacity. Used on the hot path with pool-managed buffers to avoid the
+// per-call allocation that hash.Hash.Sum(nil) incurs.
+func (th *treeHasher) digestInto(dst, data []byte) []byte {
+	th.hasher.Write(data)
+	sum := th.hasher.Sum(dst[:0])
+	th.hasher.Reset()
+	return sum
+}
+
 func (th *treeHasher) path(key []byte) []byte {
 	return th.digest(key)
+}
+
+// pathInto computes the SHA-256 path of key into dst[:0]. See digestInto.
+func (th *treeHasher) pathInto(dst, key []byte) []byte {
+	return th.digestInto(dst, key)
 }
 
 func (th *treeHasher) digestLeaf(path []byte, leafData []byte) ([]byte, []byte) {
@@ -42,6 +58,22 @@ func (th *treeHasher) digestLeaf(path []byte, leafData []byte) ([]byte, []byte) 
 	th.hasher.Reset()
 
 	return sum, value
+}
+
+// digestLeafInto writes the leaf hash into hashDst[:0] and returns it
+// alongside the leaf-data value buffer (which still escapes to the
+// MapStore). hashDst must have at least Size bytes of capacity.
+func (th *treeHasher) digestLeafInto(hashDst, path, leafData []byte) ([]byte, []byte) {
+	value := make([]byte, 0, len(leafPrefix)+len(path)+len(leafData))
+	value = append(value, leafPrefix...)
+	value = append(value, path...)
+	value = append(value, leafData...)
+
+	th.hasher.Write(value)
+	hash := th.hasher.Sum(hashDst[:0])
+	th.hasher.Reset()
+
+	return hash, value
 }
 
 func (th *treeHasher) parseLeaf(data []byte) ([]byte, []byte) {
@@ -63,6 +95,23 @@ func (th *treeHasher) digestNode(leftData []byte, rightData []byte) ([]byte, []b
 	th.hasher.Reset()
 
 	return sum, value
+}
+
+// digestNodeInto writes the node hash into hashDst[:0] and returns it
+// alongside the freshly allocated node-data value buffer (which still
+// escapes to the MapStore). hashDst must have at least Size bytes of
+// capacity.
+func (th *treeHasher) digestNodeInto(hashDst, leftData, rightData []byte) ([]byte, []byte) {
+	value := make([]byte, 0, len(nodePrefix)+len(leftData)+len(rightData))
+	value = append(value, nodePrefix...)
+	value = append(value, leftData...)
+	value = append(value, rightData...)
+
+	th.hasher.Write(value)
+	hash := th.hasher.Sum(hashDst[:0])
+	th.hasher.Reset()
+
+	return hash, value
 }
 
 func (th *treeHasher) parseNode(data []byte) ([]byte, []byte) {
