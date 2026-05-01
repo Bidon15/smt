@@ -136,11 +136,11 @@ func TestShardedSMT_GetAfterBulk(t *testing.T) {
 }
 
 // TestShardedSMT_ShardCountValidation — only powers of two between
-// 1 and 64 are accepted.
+// 1 and 256 are accepted (8-bit shard routing).
 func TestShardedSMT_ShardCountValidation(t *testing.T) {
 	mapFn := func(_ int) (MapStore, MapStore) { return NewSimpleMap(), NewSimpleMap() }
-	good := []int{1, 2, 4, 8, 16, 32, 64}
-	bad := []int{0, 3, 5, 7, 9, 65, 100, 128, -1}
+	good := []int{1, 2, 4, 8, 16, 32, 64, 128, 256}
+	bad := []int{0, 3, 5, 7, 9, 65, 100, 257, 512, -1}
 	for _, n := range good {
 		if _, err := NewShardedSMT(n, mapFn, sha256.New); err != nil {
 			t.Errorf("n=%d should be valid, got %v", n, err)
