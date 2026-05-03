@@ -220,14 +220,32 @@ func (smt *SparseMerkleTree) buildSubtree(sc *updateScratch, depth int, kvs []bu
 //
 // The existing leaf node is deleted from the MapStore; buildSubtree
 // re-Sets it under its (potentially new) parent shape.
+//
+// Fast path: if exactly one incoming kv shadows the existing leaf
+// AND its value hashes to the same valueHash as the existing leaf,
+// no rebuild is needed — the leaf hash and tree shape are unchanged.
+// This catches the common warm-update case where downstream callers
+// re-apply identical (path, value) pairs.
 func (smt *SparseMerkleTree) mergeLeafWithKVs(sc *updateScratch, currentHash, leafData []byte, depth int, kvs []bulkKV) ([]byte, error) {
-	leafPath, _ := smt.th.parseLeaf(leafData)
+	leafPath, existingValueHash := smt.th.parseLeaf(leafData)
 
 	shadowed := false
 	for i := range kvs {
 		if bytes.Equal(kvs[i].path, leafPath) {
 			shadowed = true
 			break
+		}
+	}
+
+	// Identical-value short-circuit: only safe when there's exactly
+	// one incoming kv and it shadows the existing leaf path. With
+	// more than one kv, the subtree shape changes regardless of
+	// whether the shadowing value matches — those other kvs must be
+	// inserted as new leaves.
+	if shadowed && len(kvs) == 1 {
+		newValueHash := smt.th.digestInto(sc.valueHashBuf[:], kvs[0].value)
+		if bytes.Equal(existingValueHash, newValueHash) {
+			return currentHash, nil
 		}
 	}
 
