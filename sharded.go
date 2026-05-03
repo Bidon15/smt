@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"hash"
+	"runtime"
 	"sync"
 )
 
@@ -160,6 +161,83 @@ type shardScratch struct {
 	k, v [][][]byte
 }
 
+// shardIdxBufPool reuses the per-call []uint8 buffer that holds the
+// precomputed shard index for each input key in BulkUpdate. Pool keys
+// by power-of-two capacity buckets so we don't end up with one pool
+// entry per call size.
+var shardIdxBufPool sync.Pool // *[]uint8
+
+func getShardIdxBuf(n int) []uint8 {
+	if v := shardIdxBufPool.Get(); v != nil {
+		buf := *v.(*[]uint8)
+		if cap(buf) >= n {
+			return buf
+		}
+	}
+	// Round up to nearest 4K boundary so we can reuse for similarly-
+	// sized batches without re-allocating.
+	cap := ((n + 4095) / 4096) * 4096
+	return make([]uint8, cap)
+}
+
+func putShardIdxBuf(buf []uint8) {
+	b := buf[:0]
+	shardIdxBufPool.Put(&b)
+}
+
+// parallelComputeShardIdxs computes shardOf(key) for each key into
+// idxs[i]. The work is split into chunks across runtime.GOMAXPROCS
+// goroutines (capped at 16 to avoid spawn overhead dominating for
+// small inputs). Each chunk owns a contiguous range of idxs[],
+// avoiding any cross-goroutine writes / false sharing.
+//
+// shardBits matches ShardedSMT.shardBits; we inline the routing
+// computation here rather than call s.shardOf (which would re-hash)
+// so the hot loop is one sha256 + one shift per key.
+func parallelComputeShardIdxs(idxs []uint8, keys [][]byte, shardBits uint) {
+	n := len(idxs)
+	if n == 0 {
+		return
+	}
+	if n < 1024 {
+		// Below the threshold the goroutine spawn overhead dwarfs
+		// the parallel savings. Inline.
+		for i, k := range keys {
+			h := sha256.Sum256(k)
+			idxs[i] = h[0] >> (8 - shardBits)
+		}
+		return
+	}
+	chunks := runtime.GOMAXPROCS(0)
+	if chunks > 16 {
+		chunks = 16
+	}
+	if chunks > n {
+		chunks = n
+	}
+	chunkSize := (n + chunks - 1) / chunks
+	var wg sync.WaitGroup
+	for c := 0; c < chunks; c++ {
+		start := c * chunkSize
+		end := start + chunkSize
+		if end > n {
+			end = n
+		}
+		if start >= end {
+			continue
+		}
+		wg.Add(1)
+		go func(start, end int) {
+			defer wg.Done()
+			for i := start; i < end; i++ {
+				h := sha256.Sum256(keys[i])
+				idxs[i] = h[0] >> (8 - shardBits)
+			}
+		}(start, end)
+	}
+	wg.Wait()
+}
+
 // BulkUpdate splits the (keys, values) batch by shard and applies
 // each shard's slice in parallel via per-shard goroutines. Each
 // shard uses its underlying SparseMerkleTree.BulkUpdate, which runs
@@ -192,8 +270,21 @@ func (s *ShardedSMT) BulkUpdate(keys, values [][]byte) ([]byte, error) {
 			bucketV[i] = make([][]byte, 0, hint)
 		}
 	}
+
+	// M6.2: parallel sha256 pass to compute the shard index for each
+	// key, then a serial bucketing pass that uses the precomputed
+	// indices. The original code did sha256(key) inline during the
+	// bucketing loop, which made the whole pass single-threaded. For
+	// 100K keys at ~75 ns/sha256 that's ~7-8 ms of wall time before
+	// any shard goroutine could start. The parallel hash pass cuts
+	// that to ~1 ms on 8 cores, after which the serial append loop
+	// (~3 ns/iter, cache-friendly) is fast.
+	idxs := getShardIdxBuf(len(keys))[:len(keys)]
+	defer putShardIdxBuf(idxs)
+	parallelComputeShardIdxs(idxs, keys, s.shardBits)
+
 	for i := range keys {
-		idx := s.shardOf(keys[i])
+		idx := int(idxs[i])
 		bucketK[idx] = append(bucketK[idx], keys[i])
 		bucketV[idx] = append(bucketV[idx], values[i])
 	}
